@@ -136,11 +136,22 @@ def changed_lines(diff: str) -> int:
 # ----------------------------------------------------------------------------- models
 
 class Usage:
+    """Exact counts: Claude's from `claude -p --output-format json`, local ones from Ollama's eval counts."""
     claude_calls = 0
-    claude_chars_in = 0
-    claude_chars_out = 0
+    claude_new = 0        # input + cache writes + output
+    claude_cached = 0     # cache reads (billed at a fraction)
+    claude_output = 0
+    claude_cost = 0.0     # USD at API list price, as reported by Claude Code
     local_calls = 0
-    local_chars_out = 0
+    local_tokens = 0      # prompt + generated tokens processed locally
+    local_output = 0
+
+
+# The planner / reviewer / judge never use tools, so skip Claude Code's tool definitions and default system
+# prompt, and don't load the user's MCP connectors (Gmail, Drive, ... add ~70K tokens of tool definitions per
+# call): this cuts each call's fixed overhead from ~28-100K tokens to ~1.3K.
+CLAUDE_SYSTEM = ("You are a precise senior software engineer acting as planner, reviewer and judge in an automated "
+                 "pipeline. Follow the instructions exactly and reply in the requested format, with text only.")
 
 
 def ask_claude(prompt: str, args, name: str) -> str:
@@ -148,7 +159,8 @@ def ask_claude(prompt: str, args, name: str) -> str:
         die("this step needs Claude but --no-claude is set")
     if not shutil.which("claude"):
         die("`claude` (Claude Code) not found on PATH. Install it or use --tests + --no-claude.")
-    cmd = ["claude", "-p", "Follow the instructions given on stdin. Reply with text only; do not use any tools."]
+    cmd = ["claude", "-p", "--output-format", "json", "--tools", "", "--system-prompt", CLAUDE_SYSTEM,
+           "--no-session-persistence", "--strict-mcp-config", "Follow the instructions given on stdin."]
     if args.claude_model:
         cmd += ["--model", args.claude_model]
     log(f"Claude: {name} ...")
@@ -163,9 +175,17 @@ def ask_claude(prompt: str, args, name: str) -> str:
         hint = "\nRun `claude` once in a terminal and log in, then retry." if "login" in why.lower() else ""
         die(f"`claude -p` failed during {name}:\n{why}{hint}")
     Usage.claude_calls += 1
-    Usage.claude_chars_in += len(prompt)
-    Usage.claude_chars_out += len(r.stdout)
-    return r.stdout
+    try:
+        data = json.loads(r.stdout)
+        u = data.get("usage", {})
+        Usage.claude_new += u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + u.get("output_tokens", 0)
+        Usage.claude_cached += u.get("cache_read_input_tokens", 0)
+        Usage.claude_output += u.get("output_tokens", 0)
+        Usage.claude_cost += data.get("total_cost_usd", 0.0)
+        return data.get("result", "")
+    except json.JSONDecodeError:  # older Claude Code without JSON output: estimate
+        Usage.claude_new += (len(prompt) + len(r.stdout)) // 4
+        return r.stdout
 
 
 LEDGER = Path.home() / ".cache" / "evolve" / "ledger.jsonl"
@@ -202,7 +222,8 @@ def ask_local(messages: list[dict], args, model: str, temperature: float) -> str
     record_local(model, data)
     text = data.get("message", {}).get("content", "")
     Usage.local_calls += 1
-    Usage.local_chars_out += len(text)
+    Usage.local_tokens += data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
+    Usage.local_output += data.get("eval_count", 0)
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S)
 
 
@@ -755,6 +776,7 @@ def main() -> None:
     ap.add_argument("--no-claude", action="store_true", help="never call Claude (requires --tests)")
     ap.add_argument("--claude-model", help="e.g. sonnet or opus (default: your Claude Code default)")
     ap.add_argument("--allow-dirty", action="store_true", help="run even with uncommitted changes")
+    ap.add_argument("--summary-json", help="also write a machine-readable run summary to this path")
     args = ap.parse_args()
 
     args.models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -843,9 +865,10 @@ def main() -> None:
         if r.returncode != 0:
             die(f"git worktree add failed: {r.stderr}")
 
-    winner, everyone, last_model, counter = None, [], None, 0
+    winner, everyone, last_model, counter, rounds_run = None, [], None, 0, 0
     try:
         for rnd in range(1, args.rounds + 1):
+            rounds_run = rnd
             alive = [t for t in threads if t.alive]
 
             # Breed: mutate each thread's fittest attempt (or start fresh), plus one crossover.
@@ -961,9 +984,19 @@ def main() -> None:
             log("Next step: hand the task to Claude Code directly, or split it into smaller pieces.")
 
     model_scoreboard(everyone, winner, args)
-    tin, tout = Usage.claude_chars_in // 4, Usage.claude_chars_out // 4
-    log(f"Usage: {Usage.local_calls} local generations (~{Usage.local_chars_out // 4} tokens written locally), "
-        f"{Usage.claude_calls} Claude calls (~{tin} tokens in, ~{tout} out, rough estimate).")
+    log(f"Usage: {Usage.local_calls} local generations, {Usage.claude_calls} Claude calls.")
+    log(f"🔴 Claude: {Usage.claude_new + Usage.claude_cached:,} tokens ({Usage.claude_new:,} new · "
+        f"{Usage.claude_cached:,} re-read from cache · {Usage.claude_output:,} written), ${Usage.claude_cost:.3f} at API prices")
+    log(f"🟢 Local models: {Usage.local_tokens:,} tokens ({Usage.local_output:,} written), not billed to Claude")
+    if args.summary_json:
+        Path(args.summary_json).write_text(json.dumps({
+            "solved": bool(winner), "winner_model": winner.model if winner else None,
+            "winner_lines": changed_lines(winner.diff) if winner else 0, "rounds": rounds_run,
+            "seconds": round(time.time() - T0, 1), "claude_calls": Usage.claude_calls,
+            "claude_new": Usage.claude_new, "claude_cached": Usage.claude_cached,
+            "claude_output": Usage.claude_output, "claude_cost_usd": round(Usage.claude_cost, 4),
+            "local_calls": Usage.local_calls, "local_tokens": Usage.local_tokens,
+            "local_output": Usage.local_output, "run_dir": str(args.run_dir)}, indent=2))
     sys.exit(0 if winner else 1)
 
 

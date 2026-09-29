@@ -37,6 +37,7 @@ task ─► Claude: spec + visible tests + hidden tests                         
 | `demo.py` | Runs `evolve.py` on a throwaway copy of `examples/demo`. |
 | `install_hooks.py` | 🔴/🟢 token footer after every Claude Code reply; optional "local-first" hooks. |
 | `register_mcp.py` | Adds the MCP server to the Claude desktop app (macOS, Windows, Linux). |
+| `bench/` | 14-task benchmark: agentic Claude Code vs one-shot Claude vs the hybrid, graded by hidden tests. |
 | `healthcheck/checkers.py` | A local model plays checkers against a minimax bot. Checks every model and both token trackers, then opens a visual replay. |
 
 Standard library only; no `pip install` beyond `pytest`.
@@ -53,7 +54,7 @@ Standard library only; no `pip install` beyond `pytest`.
 ## Quick start
 
 ```bash
-git clone https://github.com/USER/claude-local-evolve.git
+git clone https://github.com/Aryanwin/claude-local-evolve.git
 cd claude-local-evolve
 python3 install.py
 ```
@@ -118,6 +119,11 @@ python3 /path/to/claude-local-evolve/evolve.py \
     --files mypkg/text.py --context mypkg/models.py
 ```
 
+Claude is called through `claude -p` with no tools, a two-line system prompt and `--strict-mcp-config`, so each
+call carries ~1.3K tokens of fixed overhead instead of Claude Code's usual ~28K (plus ~70K more if you have
+MCP connectors such as Gmail or Drive connected; they're loaded into every call otherwise). Usage is read from
+`--output-format json`, so the numbers the script prints are exact.
+
 The winning change and its tests land in your working tree; review with `git diff`. The script prints the undo
 command and a per-model scoreboard. Logs and patches are kept in `~/.cache/evolve/<repo>/<timestamp>/`.
 
@@ -173,6 +179,43 @@ conversation Claude re-reads on each step, which costs a fraction of new tokens.
 `python3 install_hooks.py --local-first` also adds hooks and a `~/.claude/CLAUDE.md` rule that make Claude Code
 draft big new files with the local models first. `--remove` undoes everything; a backup of your settings is made
 on every run.
+
+## Benchmark: is it actually cheaper?
+
+14 single-file tasks (LRU cache, Dijkstra, sudoku, an expression parser, knapsack, text justification, ...),
+each solved three ways and scored by hidden grader tests that no approach sees. Claude usage is exact, from
+`claude -p --output-format json` (Claude Sonnet 5.5, the default for `claude -p` here); local models ran on the
+`medium` profile (24 GB M5 Pro). Full per-task table: [bench/RESULTS.md](bench/RESULTS.md).
+
+| | Claude Code (agentic) | Claude one-shot | Hybrid (this repo) |
+|---|---|---|---|
+| Tasks fully correct | 14/14 | 14/14 | 13/14 |
+| Claude tokens | 1,426K | 33K | 193K |
+| …new (not cache reads) | 191K | 33K | 193K |
+| …written by Claude | 30K | 12K | 67K |
+| Claude cost at API prices | $1.19 | $0.20 | $1.17 |
+| Local tokens (free) | 0 | 0 | 391K |
+| Wall time | 4 min | 2 min | 63 min |
+
+*Agentic* is Claude Code working normally (tools on, writes and runs its own tests), measured without MCP
+connectors; with connectors loaded it would cost ~70K more tokens per step. *One-shot* is a single minimal call
+that just writes the module.
+
+What this shows, honestly:
+
+- **Against Claude Code working normally, the hybrid uses 86% fewer Claude tokens, but costs about the same.**
+  Most of the agentic tokens are cheap cache reads, while every hybrid token is new, and the hybrid's planning
+  step (spec + visible tests + hidden tests, ~5K output tokens per task) is the most expensive part of the run.
+- **For small, precisely specified tasks, just asking Claude once is best:** 6x cheaper than the hybrid, 30x
+  faster, and it got all 14 right. The local models only write ~50–150 lines here, so there's little to offload.
+- **The hybrid pays off when the code is large relative to the spec**: Claude's cost is roughly fixed (plan,
+  reviews, judge) while the local models do the writing, so the gap grows with the size of the change. Passing
+  your own tests (`--tests`) skips the planning call, which is the single largest cost, and `--claude-model haiku`
+  makes the remaining calls cheaper.
+- **Reliability:** the hybrid missed 1 of 14 (`calc`, stuck at 41/42 of its own tests after 8 rounds), and it
+  is much slower on a 24 GB machine.
+
+Reproduce: `python3 bench/run_bench.py --check` (graders vs reference solutions), then `python3 bench/run_bench.py`.
 
 ## Good fits vs. bad fits
 

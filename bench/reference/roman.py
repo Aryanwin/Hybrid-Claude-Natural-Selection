@@ -1,0 +1,24 @@
+VALUES = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+          (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+
+
+def to_roman(n: int) -> str:
+    if not isinstance(n, int) or not 1 <= n <= 3999:
+        raise ValueError("out of range")
+    out = ""
+    for v, s in VALUES:
+        while n >= v:
+            out, n = out + s, n - v
+    return out
+
+
+def from_roman(s: str) -> int:
+    if not isinstance(s, str) or not s:
+        raise ValueError("empty")
+    total, i = 0, 0
+    for v, sym in VALUES:
+        while s.startswith(sym, i):
+            total, i = total + v, i + len(sym)
+    if i != len(s) or not 1 <= total <= 3999 or to_roman(total) != s:
+        raise ValueError(f"not a canonical numeral: {s!r}")
+    return total
