@@ -182,20 +182,29 @@ on every run.
 
 ## Benchmark: is it actually cheaper?
 
-14 single-file tasks (LRU cache, Dijkstra, sudoku, an expression parser, knapsack, text justification, ...),
-each solved three ways and scored by hidden grader tests that no approach sees. Claude usage is exact, from
-`claude -p --output-format json` (Claude Sonnet 5.5, the default for `claude -p` here); local models ran on the
-`medium` profile (24 GB M5 Pro). Full per-task table: [bench/RESULTS.md](bench/RESULTS.md).
+14 single-file tasks (LRU cache, Dijkstra, sudoku, an expression parser, knapsack, text justification, ...), each
+solved three ways with each of three Claude models, and scored by hidden grader tests that no approach sees.
+Claude usage is exact, from `claude -p --output-format json`; local models ran on the `medium` profile
+(24 GB M5 Pro). Full per-task tables: [bench/RESULTS.md](bench/RESULTS.md).
 
-| | Claude Code (agentic) | Claude one-shot | Hybrid (this repo) |
-|---|---|---|---|
-| Tasks fully correct | 14/14 | 14/14 | 13/14 |
-| Claude tokens | 1,426K | 33K | 193K |
-| …new (not cache reads) | 191K | 33K | 193K |
-| …written by Claude | 30K | 12K | 67K |
-| Claude cost at API prices | $1.19 | $0.20 | $1.17 |
-| Local tokens (free) | 0 | 0 | 391K |
-| Wall time | 4 min | 2 min | 63 min |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench/chart-dark.svg">
+  <img alt="Claude cost, tasks solved and Claude tokens for Haiku 4.5, Sonnet 5.5 and Opus 5.5 across the three approaches" src="bench/chart-light.svg">
+</picture>
+
+| Approach | | Haiku 4.5 | Sonnet 5.5 | Opus 5.5 |
+|---|---|---|---|---|
+| **Claude Code (agentic)** | tasks correct | 14/14 | 14/14 | 14/14 |
+| | Claude tokens | 9.20M | 1.43M | 2.20M |
+| | cost at API prices | $2.38 | $1.19 | $2.66 |
+| **Claude one-shot** | tasks correct | 12/14 | 14/14 | 14/14 |
+| | Claude tokens | 124K | 33K | 35K |
+| | cost at API prices | $0.56 | $0.20 | $0.45 |
+| **Hybrid (this repo)** | tasks correct | 7/14 | 13/14 | 13/14 |
+| | Claude tokens | 598K | 193K | 224K |
+| | cost at API prices | $2.31 | $1.17 | $2.79 |
+| | local tokens (free) | 973K | 391K | 429K |
+| | wall time | 175 min | 63 min | 49 min |
 
 *Agentic* is Claude Code working normally (tools on, writes and runs its own tests), measured without MCP
 connectors; with connectors loaded it would cost ~70K more tokens per step. *One-shot* is a single minimal call
@@ -203,19 +212,27 @@ that just writes the module.
 
 What this shows, honestly:
 
-- **Against Claude Code working normally, the hybrid uses 86% fewer Claude tokens, but costs about the same.**
-  Most of the agentic tokens are cheap cache reads, while every hybrid token is new, and the hybrid's planning
-  step (spec + visible tests + hidden tests, ~5K output tokens per task) is the most expensive part of the run.
-- **For small, precisely specified tasks, just asking Claude once is best:** 6x cheaper than the hybrid, 30x
-  faster, and it got all 14 right. The local models only write ~50–150 lines here, so there's little to offload.
-- **The hybrid pays off when the code is large relative to the spec**: Claude's cost is roughly fixed (plan,
-  reviews, judge) while the local models do the writing, so the gap grows with the size of the change. Passing
-  your own tests (`--tests`) skips the planning call, which is the single largest cost, and `--claude-model haiku`
-  makes the remaining calls cheaper.
-- **Reliability:** the hybrid missed 1 of 14 (`calc`, stuck at 41/42 of its own tests after 8 rounds), and it
-  is much slower on a 24 GB machine.
+- **Against Claude Code working normally, the hybrid cuts Claude tokens by 86–90%** (Sonnet 1.43M → 193K,
+  Opus 2.20M → 224K), **but not cost**: most agentic tokens are cheap cache reads, while every hybrid token is
+  new and its planning step (spec + visible + hidden tests) writes a lot of output. Sonnet: $1.17 vs $1.19;
+  Opus: $2.79 vs $2.66.
+- **For small, precisely specified tasks, one Claude call is best** with Sonnet or Opus: 14/14, 6x cheaper than
+  the hybrid, and done in minutes. The local models only write ~50–150 lines here, so there's little to offload.
+- **Sonnet is the sweet spot** for every approach here. Opus solved the same tasks for 2.2–2.4x the price.
+  Haiku is cheaper per token but not per task: it took 6.5x Sonnet's tokens as an agent, wrote 9x more output
+  one-shot, and cost more than Sonnet in all three approaches.
+- **The planner must be a strong model.** Haiku's hybrid "failed" 7 tasks, but in 5 of them the local models'
+  code passes every benchmark grader: Haiku's own hidden tests had wrong expected values (e.g. "wednesday" →
+  "saturday" is 6 edits, not 5), so correct code was rejected and the run kept evolving until it gave up.
+  Opus's one hybrid failure (`levenshtein`) is the same thing: one wrong hidden test, correct code. Judged by the
+  code itself, the local models solved 12/14 under Haiku and 14/14 under Opus.
+- **The hybrid should pay off when the code is large relative to the spec**: Claude's cost is roughly fixed
+  (plan, reviews, judge) while the local models do the writing. Passing your own tests (`--tests`) skips the
+  planning call, the single largest cost.
 
-Reproduce: `python3 bench/run_bench.py --check` (graders vs reference solutions), then `python3 bench/run_bench.py`.
+Reproduce: `python3 bench/run_bench.py --check` (graders vs reference solutions), then
+`python3 bench/run_bench.py --claude-model sonnet` (or `haiku` / `opus`), and
+`python3 bench/chart.py haiku=... sonnet=... opus=...` for the chart.
 
 ## Good fits vs. bad fits
 

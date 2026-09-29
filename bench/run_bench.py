@@ -229,6 +229,32 @@ def report(path: Path) -> str:
     return "\n".join(out) + "\n"
 
 
+def compare(named: list[tuple[str, Path]]) -> str:
+    """Side-by-side summary of several result files (e.g. the same benchmark with different Claude models)."""
+    runs = [(label, json.loads(p.read_text())) for label, p in named]
+    names = {"agentic": "Claude Code (agentic)", "oneshot": "Claude one-shot", "hybrid": "Hybrid"}
+    head = "| Approach | Metric | " + " | ".join(label for label, _ in runs) + " |"
+    out = ["## By Claude model", "", head, "|---|---" + "|---" * len(runs) + "|"]
+    for m in MODES:
+        sel = [[r for r in rows if r["mode"] == m] for _, rows in runs]
+        if not all(sel):
+            continue
+        metrics = {
+            "Tasks fully correct": lambda rs: f"{sum(r['passed'] == r['total'] > 0 for r in rs)}/{len(rs)}",
+            "Grader tests passed": lambda rs: f"{sum(r['passed'] for r in rs)}/{sum(r['total'] for r in rs)}",
+            "Claude tokens": lambda rs: fmt(sum(r["claude_new"] + r["claude_cached"] for r in rs)),
+            "Claude output tokens": lambda rs: fmt(sum(r["claude_output"] for r in rs)),
+            "Claude cost (API prices)": lambda rs: f"${sum(r['cost_usd'] for r in rs):.2f}",
+            "Local tokens": lambda rs: fmt(sum(r["local_tokens"] for r in rs)),
+            "Wall time": lambda rs: f"{sum(r['seconds'] for r in rs) / 60:.0f} min",
+        }
+        for i, (label, f) in enumerate(metrics.items()):
+            if label == "Local tokens" and m != "hybrid":
+                continue
+            out.append(f"| {names[m] if i == 0 else ''} | {label} | " + " | ".join(f(rs) for rs in sel) + " |")
+    return "\n".join(out) + "\n"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tasks", default="all", help="comma list of task names (default: all)")
@@ -238,8 +264,13 @@ def main() -> None:
     ap.add_argument("--out", help="results JSON (default bench/results/results-<timestamp>.json)")
     ap.add_argument("--check", action="store_true", help="verify graders against the reference solutions")
     ap.add_argument("--report", help="write bench/RESULTS.md from a results JSON")
+    ap.add_argument("--compare", nargs="+", metavar="LABEL=FILE",
+                    help="side-by-side table of several result files, e.g. sonnet=a.json haiku=b.json")
     args = ap.parse_args()
 
+    if args.compare:
+        print(compare([(x.split("=", 1)[0], Path(x.split("=", 1)[1])) for x in args.compare]))
+        return
     if args.check:
         check()
     if args.report:
