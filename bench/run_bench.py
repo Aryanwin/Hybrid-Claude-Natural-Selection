@@ -37,7 +37,18 @@ from tasks import TASKS  # noqa: E402
 
 ONESHOT_SYSTEM = "You are a precise senior Python engineer. Follow the instructions exactly."
 MODES = ("agentic", "oneshot", "hybrid")
+# "hybrid2" = a later hybrid rerun (near-miss snippets + hidden-test disputes), merged in with --merge-v2
+REPORT_MODES = MODES + ("hybrid2",)
 LOCK = threading.Lock()
+
+
+def load_rows(spec: str) -> list[dict]:
+    """FILE or FILE+V2FILE: rows of FILE, plus the hybrid rows of V2FILE relabelled as mode "hybrid2"."""
+    first, *rest = spec.split("+")
+    rows = json.loads(Path(first).read_text())
+    for extra in rest:
+        rows += [{**r, "mode": "hybrid2"} for r in json.loads(Path(extra).read_text()) if r["mode"] == "hybrid"]
+    return rows
 
 
 def usage_row(data: dict) -> dict:
@@ -164,9 +175,10 @@ def fmt(n: float) -> str:
 def report(path: Path) -> str:
     rows = json.loads(path.read_text())
     by = {(r["task"], r["mode"]): r for r in rows}
-    modes = [m for m in MODES if any(r["mode"] == m for r in rows)]
+    modes = [m for m in REPORT_MODES if any(r["mode"] == m for r in rows)]
     tasks = [t for t, _, _ in TASKS if any(r["task"] == t for r in rows)]
-    names = {"agentic": "Claude Code (agentic)", "oneshot": "Claude one-shot", "hybrid": "Hybrid (this repo)"}
+    names = {"agentic": "Claude Code (agentic)", "oneshot": "Claude one-shot", "hybrid": "Hybrid (this repo)",
+             "hybrid2": "Hybrid v2 (+ near-miss, disputes)"}
 
     out = ["# Benchmark results", "",
            f"{len(tasks)} tasks, each solved three ways and scored by hidden grader tests "
@@ -197,7 +209,7 @@ def report(path: Path) -> str:
     if "hybrid" in modes:
         out += ["", "**Hybrid vs. the others** (Claude cost at API prices, which weights output and cache reads correctly):", ""]
         h = total("hybrid", "cost_usd")
-        for m in (x for x in modes if x != "hybrid"):
+        for m in (x for x in modes if not x.startswith("hybrid")):
             o = total(m, "cost_usd")
             if o:
                 out.append(f"- vs {names[m]}: {'saves' if h < o else 'costs'} {abs(1 - h / o):.0%} "
@@ -216,7 +228,7 @@ def report(path: Path) -> str:
                 continue
             mark = "✅" if r["passed"] == r["total"] > 0 else "❌"
             c = f"{mark} {r['passed']}/{r['total']} · {fmt(r['claude_new'] + r['claude_cached'])} / {fmt(r['claude_new'])} · ${r['cost_usd']:.3f}"
-            if m == "hybrid":
+            if m.startswith("hybrid"):
                 c += f" · {fmt(r['local_tokens'])} local"
             if r["note"]:
                 c += " ⚠️"
@@ -231,11 +243,12 @@ def report(path: Path) -> str:
 
 def compare(named: list[tuple[str, Path]]) -> str:
     """Side-by-side summary of several result files (e.g. the same benchmark with different Claude models)."""
-    runs = [(label, json.loads(p.read_text())) for label, p in named]
-    names = {"agentic": "Claude Code (agentic)", "oneshot": "Claude one-shot", "hybrid": "Hybrid"}
+    runs = [(label, load_rows(str(p))) for label, p in named]
+    names = {"agentic": "Claude Code (agentic)", "oneshot": "Claude one-shot", "hybrid": "Hybrid",
+             "hybrid2": "Hybrid v2 (+ near-miss, disputes)"}
     head = "| Approach | Metric | " + " | ".join(label for label, _ in runs) + " |"
     out = ["## By Claude model", "", head, "|---|---" + "|---" * len(runs) + "|"]
-    for m in MODES:
+    for m in REPORT_MODES:
         sel = [[r for r in rows if r["mode"] == m] for _, rows in runs]
         if not all(sel):
             continue
@@ -249,7 +262,7 @@ def compare(named: list[tuple[str, Path]]) -> str:
             "Wall time": lambda rs: f"{sum(r['seconds'] for r in rs) / 60:.0f} min",
         }
         for i, (label, f) in enumerate(metrics.items()):
-            if label == "Local tokens" and m != "hybrid":
+            if label == "Local tokens" and not m.startswith("hybrid"):
                 continue
             out.append(f"| {names[m] if i == 0 else ''} | {label} | " + " | ".join(f(rs) for rs in sel) + " |")
     return "\n".join(out) + "\n"
@@ -265,7 +278,7 @@ def main() -> None:
     ap.add_argument("--check", action="store_true", help="verify graders against the reference solutions")
     ap.add_argument("--report", help="write bench/RESULTS.md from a results JSON")
     ap.add_argument("--compare", nargs="+", metavar="LABEL=FILE",
-                    help="side-by-side table of several result files, e.g. sonnet=a.json haiku=b.json")
+                    help="side-by-side table of result files, e.g. sonnet=a.json haiku=b.json; FILE+V2FILE adds a Hybrid v2 column")
     args = ap.parse_args()
 
     if args.compare:

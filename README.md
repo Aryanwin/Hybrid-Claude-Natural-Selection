@@ -19,7 +19,9 @@ task ─► Claude: spec + visible tests + hidden tests                         
                    no progress for 2 rounds → pruned, a fresh thread takes its place
      ─► every 2 rounds Claude reads a compact digest of all threads          (1 call each)
           keep · kill (dead end) · refine (pointed hint) · fork (clone onto another model)
+     ─► a thread stuck 1–2 tests from passing? early review; Claude may send a ≤25-line code snippet
      ─► visible-test passers must also pass hidden tests (catches test-gaming)
+          fails hidden but passes visible? Claude referees: fix wrong hidden tests, or hint the bug
      ─► 2+ finalists? Claude picks one from the diffs                         (1 call)
      ─► winner + tests written into your working tree; you review with git diff
 ```
@@ -136,7 +138,9 @@ command and a per-model scoreboard. Logs and patches are kept in `~/.cache/evolv
 | `--rounds` | 8 | Maximum rounds |
 | `--review-every` | 2 | Claude reviews the threads every N rounds (0 = never) |
 | `--claude-budget` | 6 | Hard cap on Claude calls per run (one is kept for the judge) |
-| `--claude-model sonnet` | your default | Cheaper Claude model for planning, reviews and judging |
+| `--claude-model sonnet` | your default | Claude model for planning, reviews and judging (Sonnet was the best value in the benchmark) |
+| `--near-miss` | 2 | A thread this many tests from passing and stuck 2+ rounds gets an early review and may get a code snippet (0 = off) |
+| `--disputes` | 2 | Times per run Claude referees code that passes visible but fails hidden tests (0 = off) |
 | `--tests f.py --no-claude` | – | Your own tests, no Claude at all |
 | `--full-suite` | off | Finalists must also pass your whole existing test suite |
 
@@ -183,56 +187,63 @@ on every run.
 ## Benchmark: is it actually cheaper?
 
 14 single-file tasks (LRU cache, Dijkstra, sudoku, an expression parser, knapsack, text justification, ...), each
-solved three ways with each of three Claude models, and scored by hidden grader tests that no approach sees.
-Claude usage is exact, from `claude -p --output-format json`; local models ran on the `medium` profile
-(24 GB M5 Pro). Full per-task tables: [bench/RESULTS.md](bench/RESULTS.md).
+solved with each of three Claude models, and scored by hidden grader tests that no approach sees. Claude usage is
+exact, from `claude -p --output-format json`; local models ran on the `medium` profile (24 GB M5 Pro). Full
+per-task tables: [bench/RESULTS.md](bench/RESULTS.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench/chart-dark.svg">
-  <img alt="Claude cost, tasks solved and Claude tokens for Haiku 4.5, Sonnet 5.5 and Opus 5.5 across the three approaches" src="bench/chart-light.svg">
+  <img alt="Claude cost, tasks solved and Claude tokens for Haiku 4.5, Sonnet 5.5 and Opus 5.5 across four approaches" src="bench/chart-light.svg">
 </picture>
 
 | Approach | | Haiku 4.5 | Sonnet 5.5 | Opus 5.5 |
 |---|---|---|---|---|
 | **Claude Code (agentic)** | tasks correct | 14/14 | 14/14 | 14/14 |
-| | Claude tokens | 9.20M | 1.43M | 2.20M |
-| | cost at API prices | $2.38 | $1.19 | $2.66 |
+| | Claude tokens · cost | 9.20M · $2.38 | 1.43M · $1.19 | 2.20M · $2.66 |
 | **Claude one-shot** | tasks correct | 12/14 | 14/14 | 14/14 |
-| | Claude tokens | 124K | 33K | 35K |
-| | cost at API prices | $0.56 | $0.20 | $0.45 |
-| **Hybrid (this repo)** | tasks correct | 7/14 | 13/14 | 13/14 |
-| | Claude tokens | 598K | 193K | 224K |
-| | cost at API prices | $2.31 | $1.17 | $2.79 |
-| | local tokens (free) | 973K | 391K | 429K |
-| | wall time | 175 min | 63 min | 49 min |
+| | Claude tokens · cost | 124K · $0.56 | 33K · $0.20 | 35K · $0.45 |
+| **Hybrid v1** | tasks correct | 7/14 | 13/14 | 13/14 |
+| | Claude tokens · cost | 598K · $2.31 | 193K · $1.17 | 224K · $2.79 |
+| **Hybrid v2** (current) | tasks correct | **11/14** | **14/14** | **14/14** |
+| | Claude tokens · cost | 688K · $2.72 | 216K · $1.29 | 204K · $2.65 |
+| | local tokens (free) · wall time | 838K · 130 min | 410K · 78 min | 332K · 49 min |
 
 *Agentic* is Claude Code working normally (tools on, writes and runs its own tests), measured without MCP
 connectors; with connectors loaded it would cost ~70K more tokens per step. *One-shot* is a single minimal call
-that just writes the module.
+that just writes the module. *Hybrid v2* adds near-miss code snippets and hidden-test disputes (below); v1 is
+kept for comparison.
 
-What this shows, honestly:
+**What v2 changed.** v1's failures had two causes, and v2 fixes each with a small, capped amount of Claude:
 
-- **Against Claude Code working normally, the hybrid cuts Claude tokens by 86–90%** (Sonnet 1.43M → 193K,
-  Opus 2.20M → 224K), **but not cost**: most agentic tokens are cheap cache reads, while every hybrid token is
-  new and its planning step (spec + visible + hidden tests) writes a lot of output. Sonnet: $1.17 vs $1.19;
-  Opus: $2.79 vs $2.66.
-- **For small, precisely specified tasks, one Claude call is best** with Sonnet or Opus: 14/14, 6x cheaper than
-  the hybrid, and done in minutes. The local models only write ~50–150 lines here, so there's little to offload.
-- **Sonnet is the sweet spot** for every approach here. Opus solved the same tasks for 2.2–2.4x the price.
-  Haiku is cheaper per token but not per task: it took 6.5x Sonnet's tokens as an agent, wrote 9x more output
-  one-shot, and cost more than Sonnet in all three approaches.
-- **The planner must be a strong model.** Haiku's hybrid "failed" 7 tasks, but in 5 of them the local models'
-  code passes every benchmark grader: Haiku's own hidden tests had wrong expected values (e.g. "wednesday" →
-  "saturday" is 6 edits, not 5), so correct code was rejected and the run kept evolving until it gave up.
-  Opus's one hybrid failure (`levenshtein`) is the same thing: one wrong hidden test, correct code. Judged by the
-  code itself, the local models solved 12/14 under Haiku and 14/14 under Opus.
+- *Hidden tests written wrong.* Hidden tests are written in one shot and never run, and 6 of v1's failures were
+  correct code rejected by a wrong hidden test (e.g. "wednesday" → "saturday" is 6 edits, not 5). In v2, when a
+  candidate passes every visible test but fails hidden ones, Claude referees. Across the three models it did so
+  13 times: 8 times the hidden tests were wrong and were corrected, 5 times the code really was wrong and the
+  thread got a pointed hint.
+- *Structural bugs that words can't fix.* A thread stuck 1–2 tests from passing now gets an early review and may
+  receive a ≤25-line code snippet (23 were sent). That solved `calc`, the expression parser, which v1 never did
+  with Haiku or Sonnet.
+
+**What this shows, honestly:**
+
+- **The hybrid now matches Claude Code's accuracy with Sonnet and Opus (14/14) while cutting Claude tokens by
+  85–91%** (Sonnet 1.43M → 216K, Opus 2.20M → 204K), **but not cost**: most agentic tokens are cheap cache
+  reads, while every hybrid token is new and planning (spec + visible + hidden tests) writes a lot of output.
+  Sonnet: $1.29 vs $1.19; Opus: $2.65 vs $2.66.
+- **For small, precisely specified tasks, one Claude call is still best** with Sonnet or Opus: 14/14, ~6x cheaper
+  than the hybrid, done in minutes. The local models only write ~50–150 lines here, so there's little to offload.
+- **Sonnet is the sweet spot.** Opus solved the same tasks for 2.1–2.2x the price. Haiku is cheaper per token but
+  not per task: it took 6.5x Sonnet's tokens as an agent, wrote 9x more output one-shot, and cost more than Sonnet
+  in every approach.
+- **The planner should be a strong model.** Disputes rescued 4 of Haiku's tasks, but Haiku still wrote the most
+  wrong tests (7 of the 8 caught) and missed 3 tasks. Use `--claude-model sonnet`.
 - **The hybrid should pay off when the code is large relative to the spec**: Claude's cost is roughly fixed
   (plan, reviews, judge) while the local models do the writing. Passing your own tests (`--tests`) skips the
   planning call, the single largest cost.
 
 Reproduce: `python3 bench/run_bench.py --check` (graders vs reference solutions), then
-`python3 bench/run_bench.py --claude-model sonnet` (or `haiku` / `opus`), and
-`python3 bench/chart.py haiku=... sonnet=... opus=...` for the chart.
+`python3 bench/run_bench.py --claude-model sonnet` (or `haiku` / `opus`), and for the chart
+`python3 bench/chart.py sonnet=bench/results/results-sonnet.json+bench/results/results-sonnet-v2.json ...`.
 
 ## Good fits vs. bad fits
 

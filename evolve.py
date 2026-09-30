@@ -12,7 +12,9 @@ evolve.py - Darwinian coding loop: a roster of local models evolves competing th
                 threads with no progress for --patience rounds die and fresh ones replace them
          -> every --review-every rounds Claude reads a compact digest of all threads and
             kills, keeps, refines (a targeted hint) or forks them onto another model  (1 call each)
-         -> visible-test passers must also pass the hidden tests (catches test-gaming)
+         -> a thread stuck 1-2 tests from passing gets an early review, with an optional code snippet
+         -> visible-test passers must also pass the hidden tests (catches test-gaming); when they fail only
+            the hidden ones, Claude referees: corrects wrong hidden tests, or sends the thread a hint
          -> 2+ finalists: Claude picks the winner from the diffs                     (1 call)
          -> winner + tests written into your working tree for you to review with `git diff`
 
@@ -531,6 +533,8 @@ def thread_digest(t: Thread, args) -> str:
         head += f"\ncurrent hint: {t.hint}"
     if b is None:
         return head + "\n(no attempt yet)"
+    if near_miss(t, args):
+        head += "\nNEAR MISS: stuck 1-2 tests from passing. A code snippet is allowed for this thread."
     flag = f" [{b.note}]" if b.note else ""
     return (f"{head}\nbest attempt {b.id} ({b.kind}): {b.passed}/{b.total} tests{flag}, "
             f"{changed_lines(b.diff)} changed lines\n"
@@ -568,14 +572,17 @@ For every live thread choose one action:
 - kill:   dead end (wrong approach, hard-coding test cases, stuck on the same failure, redundant with a
           better thread). Killed threads are replaced by fresh local attempts for free.
 - refine: promising but stuck. Give a pointed hint (under 80 words) naming the specific bug and fix.
-          Do not write the solution.
+          Do not write the whole solution. For a thread marked NEAR MISS you may also add "snippet": at most
+          25 lines of code showing the fix (e.g. the corrected function or the reordered grammar rules),
+          because small models often can't carry out a structural fix from words alone.
 - fork:   copy this thread's best attempt into a NEW thread, usually on a different model (set "model"),
           optionally with a hint. Use when the approach is right but the model seems to be the bottleneck.
 Keep at least one thread alive.
 
 Reply exactly as:
 <decisions>
-{{"threads": [{{"id": "T1", "action": "keep|kill|refine|fork", "hint": "...", "model": "for fork only"}}],
+{{"threads": [{{"id": "T1", "action": "keep|kill|refine|fork", "hint": "...", "snippet": "NEAR MISS refine only",
+               "model": "for fork only"}}],
  "global_hint": "optional, short, sent to every thread; empty if not needed"}}
 </decisions>
 <fixed_tests>complete corrected visible test file, ONLY if the tests themselves are wrong</fixed_tests>"""
@@ -599,8 +606,12 @@ Reply exactly as:
             t.alive, t.fate = False, f"killed by Claude r{rnd}: {hint or 'dead end'}"
             log(f"  {t.id} ({t.model}) killed. {hint}")
         elif action == "refine" and hint:
+            snippet = str(d.get("snippet") or "").strip().strip("`").removeprefix("python").strip()
+            if snippet and near_miss(t, args):
+                snippet = "\n".join(snippet.splitlines()[:25])
+                hint += f"\nApply this fix (adapt names to your code):\n```python\n{snippet}\n```"
             t.hint, t.stale = hint, 0
-            log(f"  {t.id} ({t.model}) refined: {hint}")
+            log(f"  {t.id} ({t.model}) refined{' with a code snippet' if snippet else ''}: {hint.splitlines()[0]}")
         elif action == "fork" and t.best and room > 0:
             model = d.get("model") if d.get("model") in args.models else other_model(t.model, args)
             child = ctx.spawn(model, f"fork:{t.id}", rnd, hint)
@@ -624,6 +635,54 @@ Reply exactly as:
         ctx.visible_tests = strip_fences(fixed)
         return True
     return False
+
+
+def claude_dispute(ctx, c: Candidate, out: str, args, rnd: int) -> str:
+    """A candidate passes every visible test but fails hidden ones. Hidden tests are written in one shot and are
+    sometimes wrong, which silently rejects correct code, so Claude referees before the rejection sticks.
+    Returns "tests" (hidden tests were wrong and have been replaced) or "code" (c.feedback now holds a hint)."""
+    prompt = f"""A candidate passes ALL visible tests but fails some of the HIDDEN tests you wrote for this spec.
+Hidden tests are written without running them, so they are sometimes wrong. Decide who is wrong. For every failing
+assertion, work out the correct expected value from the SPEC step by step before deciding. Do not use any tools.
+
+SPEC:
+{ctx.spec}
+
+CANDIDATE CODE:
+{fmt_files({p: v for p, v in c.files.items()})}
+
+HIDDEN TESTS ({ctx.hidden_path}):
+```python
+{ctx.hidden_tests}```
+
+FAILURE OUTPUT:
+```
+{clip(out, 4000, tail=True)}
+```
+
+If any failing hidden test contradicts the spec, reply:
+<verdict>tests</verdict>
+<why>one or two sentences</why>
+<fixed_hidden_tests>the complete corrected hidden test file (fix or delete only the wrong tests)</fixed_hidden_tests>
+
+If the hidden tests are right and the code is wrong, reply:
+<verdict>code</verdict>
+<why>one or two sentences</why>
+<hint>under 80 words for the developer: the bug and the input class it fails on, without quoting the hidden tests</hint>"""
+    reply = ask_claude(prompt, args, f"dispute_r{rnd}_{c.id}")
+    verdict = (tag(reply, "verdict") or "").strip().lower()
+    why = tag(reply, "why") or ""
+    fixed = tag(reply, "fixed_hidden_tests") or ""
+    if verdict.startswith("test") and "def test" in fixed:
+        ctx.hidden_tests = strip_fences(fixed)
+        (args.run_dir / f"hidden_tests_fixed_r{rnd}.py.txt").write_text(ctx.hidden_tests)
+        log(f"  dispute on {c.id}: the hidden tests were wrong ({why}) Tests corrected.")
+        return "tests"
+    hint = tag(reply, "hint") or why
+    c.feedback = ("Your code passes the visible tests but fails additional hidden checks of the same spec. "
+                  f"A reviewer looked at the failures: {hint}")
+    log(f"  dispute on {c.id}: the code is wrong ({why})")
+    return "code"
 
 
 def claude_judge(ctx, finalists: list[Candidate], args) -> tuple[Candidate | None, str]:
@@ -683,6 +742,13 @@ def select(alive: list[Thread], pop: list[Candidate], rnd: int) -> None:
         t.best = max(kids + ([t.best] if t.best else []), key=lambda c: c.score())
         t.stale = 0 if t.best.progress() > before else t.stale + 1
         t.history.append(f"{t.best.passed}/{t.best.total}")
+
+
+def near_miss(t: Thread, args) -> bool:
+    """A thread whose best attempt is 1-2 failing tests away from passing and has stopped improving."""
+    b = t.best
+    return (t.alive and b is not None and b.total > 2 and 0 < b.total - b.passed <= args.near_miss
+            and b.note in ("", "hidden") and t.stale >= 2)
 
 
 def prune_duplicates(alive: list[Thread], rnd: int) -> None:
@@ -763,6 +829,11 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=8, help="maximum rounds")
     ap.add_argument("--patience", type=int, default=2, help="rounds without progress before a thread is pruned")
     ap.add_argument("--review-every", type=int, default=2, help="Claude reviews the threads every N rounds (0 = never)")
+    ap.add_argument("--disputes", type=int, default=2,
+                    help="times per run Claude may referee code that passes visible but fails hidden tests (0 = off)")
+    ap.add_argument("--near-miss", type=int, default=2,
+                    help="a thread this many failing tests from passing, stuck 2+ rounds, gets an early review and "
+                         "may receive a code snippet from Claude (0 = off)")
     ap.add_argument("--claude-budget", type=int, default=6, help="max Claude calls per run (plan + reviews + judge)")
     ap.add_argument("--review-diff-chars", type=int, default=2500, help="diff shown to Claude per thread")
     ap.add_argument("--review-fail-chars", type=int, default=600, help="failure output shown to Claude per thread")
@@ -866,6 +937,7 @@ def main() -> None:
             die(f"git worktree add failed: {r.stderr}")
 
     winner, everyone, last_model, counter, rounds_run = None, [], None, 0, 0
+    disputes_left = args.disputes
     try:
         for rnd in range(1, args.rounds + 1):
             rounds_run = rnd
@@ -899,18 +971,30 @@ def main() -> None:
             everyone += pop
 
             # Hidden-test gate: a visible pass only counts if the hidden tests pass too.
-            finalists = []
+            finalists, disputed_this_round = [], False
             for c in sorted([c for c in pop if c.ok], key=lambda c: c.score(), reverse=True)[:4]:
                 ok, out = final_check(c, slots[0], ctx, args)
+                if not ok and not disputed_this_round and disputes_left > 0 and ctx.hidden_tests \
+                        and not args.full_suite and claude_left(args) > 1:
+                    # Referee once per round: were the hidden tests wrong, or the code?
+                    disputes_left -= 1
+                    disputed_this_round = True
+                    (args.run_dir / f"{c.id}_final_check.txt").write_text(out)
+                    if claude_dispute(ctx, c, out, args, rnd) == "tests":
+                        ok, out = final_check(c, slots[0], ctx, args)
+                    else:
+                        c.note = "hidden"
+                        continue
                 if ok:
                     finalists.append(c)
                 else:
                     log(f"  {c.id} ({c.thread}) passes visible tests but fails the hidden/full-suite checks.")
                     (args.run_dir / f"{c.id}_final_check.txt").write_text(out)
                     c.note = "hidden"
-                    c.feedback = ("Your code passes the visible tests but fails additional hidden checks of the "
-                                  "same spec. Make the implementation fully general: re-read the spec, handle "
-                                  "every edge case it lists, and do not special-case test inputs.")
+                    if not c.feedback.startswith("Your code passes the visible tests but fails additional hidden checks"):
+                        c.feedback = ("Your code passes the visible tests but fails additional hidden checks of the "
+                                      "same spec. Make the implementation fully general: re-read the spec, handle "
+                                      "every edge case it lists, and do not special-case test inputs.")
 
             select(alive, pop, rnd)
             print_round(rnd, threads, pop)
@@ -937,8 +1021,11 @@ def main() -> None:
             alive = [t for t in threads if t.alive]
             prune_duplicates(alive, rnd)
             alive = [t for t in threads if t.alive]
-            review_due = (args.review_every and rnd % args.review_every == 0
-                          and claude_left(args) > 1)  # always keep one call for the judge
+            scheduled = args.review_every and rnd % args.review_every == 0
+            stuck_close = args.near_miss and any(near_miss(t, args) for t in alive)
+            review_due = (scheduled or stuck_close) and claude_left(args) > 1  # always keep one call for the judge
+            if stuck_close and not scheduled and review_due:
+                log("  near miss: a thread is 1-2 tests from passing and stuck, asking Claude early")
             if review_due:
                 if claude_review(ctx, threads, args, rnd):
                     live = [t.best for t in threads if t.alive and t.best]
@@ -992,7 +1079,7 @@ def main() -> None:
         Path(args.summary_json).write_text(json.dumps({
             "solved": bool(winner), "winner_model": winner.model if winner else None,
             "winner_lines": changed_lines(winner.diff) if winner else 0, "rounds": rounds_run,
-            "seconds": round(time.time() - T0, 1), "claude_calls": Usage.claude_calls,
+            "seconds": round(time.time() - T0, 1), "claude_calls": Usage.claude_calls, "disputes_used": args.disputes - disputes_left,
             "claude_new": Usage.claude_new, "claude_cached": Usage.claude_cached,
             "claude_output": Usage.claude_output, "claude_cost_usd": round(Usage.claude_cost, 4),
             "local_calls": Usage.local_calls, "local_tokens": Usage.local_tokens,
