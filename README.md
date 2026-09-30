@@ -9,7 +9,8 @@ It adapts to the computer it runs on: `hardware.py` detects memory and GPU and p
 context sizes that fit, from an 8 GB laptop to a 64 GB+ workstation.
 
 ```
-task ─► Claude: spec + visible tests + hidden tests                               (1 call)
+task ─► small change? Claude writes it + a few tests in one lean call; passes → done  (1 call)
+     ─► otherwise / if that fails: Claude writes spec + compact visible and hidden tests (1 call)
      ─► N threads, each owned by a local model from this machine's profile
      ─► every round, all local and free:
           mutate   each thread's fittest attempt, with its own test failures fed back
@@ -17,12 +18,12 @@ task ─► Claude: spec + visible tests + hidden tests                         
           score    pytest, each candidate in its own git worktree
           select   thread keeps its fittest · identical threads dropped ·
                    no progress for 2 rounds → pruned, a fresh thread takes its place
-     ─► every 2 rounds Claude reads a compact digest of all threads          (1 call each)
+     ─► when the run stalls, Claude reads a compact digest of all threads     (1 call each)
           keep · kill (dead end) · refine (pointed hint) · fork (clone onto another model)
      ─► a thread stuck 1–2 tests from passing? early review; Claude may send a ≤25-line code snippet
      ─► visible-test passers must also pass hidden tests (catches test-gaming)
           fails hidden but passes visible? Claude referees: fix wrong hidden tests, or hint the bug
-     ─► 2+ finalists? Claude picks one from the diffs                         (1 call)
+     ─► finalists verified by hidden tests → smallest change wins (Claude judges only without hidden tests)
      ─► winner + tests written into your working tree; you review with git diff
 ```
 
@@ -121,9 +122,17 @@ python3 /path/to/claude-local-evolve/evolve.py \
     --files mypkg/text.py --context mypkg/models.py
 ```
 
-Claude is called through `claude -p` with no tools, a two-line system prompt and `--strict-mcp-config`, so each
+**By default (`--mode auto`) small changes don't use the hybrid at all.** When the editable files total at most
+`--oneshot-max-lines` (400) lines, Claude first writes the change plus a few tests in one lean call; if its code
+passes, that's the result (1 Claude call, no local compute). Only if it fails does the hybrid take over, starting
+from that attempt. In the benchmark a single call was ~6x cheaper than the hybrid on small tasks, while the hybrid
+pays off on larger changes. `--mode hybrid` always evolves; `--mode oneshot` never does.
+
+Claude is called through `claude -p` with no tools, a short system prompt and `--strict-mcp-config`, so each
 call carries ~1.3K tokens of fixed overhead instead of Claude Code's usual ~28K (plus ~70K more if you have
-MCP connectors such as Gmail or Drive connected; they're loaded into every call otherwise). Usage is read from
+MCP connectors such as Gmail or Drive connected). The context every call shares (task, files, spec, tests) sits
+in a byte-identical system prompt with a 5-minute cache, so after the first call it's read from Claude's prompt
+cache (measured: 73% cheaper per call, and cache writes 37% cheaper than the 1-hour default). Usage is read from
 `--output-format json`, so the numbers the script prints are exact.
 
 The winning change and its tests land in your working tree; review with `git diff`. The script prints the undo
@@ -136,8 +145,10 @@ command and a per-model scoreboard. Logs and patches are kept in `~/.cache/evolv
 | `--models a,b,c` | profile | Local model roster, assigned to threads round-robin |
 | `--threads` | profile | Live threads per round |
 | `--rounds` | 8 | Maximum rounds |
-| `--review-every` | 2 | Claude reviews the threads every N rounds (0 = never) |
-| `--claude-budget` | 6 | Hard cap on Claude calls per run (one is kept for the judge) |
+| `--mode` | auto | `auto`: one-shot first for small changes, hybrid if it fails · `hybrid` · `oneshot` |
+| `--oneshot-max-lines` | 400 | Auto mode tries one-shot only up to this many editable lines |
+| `--review-every` | 0 | Also review on a fixed schedule (default: only when the run stalls or a thread is a near miss) |
+| `--claude-budget` | 7 | Hard cap on Claude calls per run (one is kept for the judge) |
 | `--claude-model sonnet` | your default | Claude model for planning, reviews and judging (Sonnet was the best value in the benchmark) |
 | `--near-miss` | 2 | A thread this many tests from passing and stuck 2+ rounds gets an early review and may get a code snippet (0 = off) |
 | `--disputes` | 2 | Times per run Claude referees code that passes visible but fails hidden tests (0 = off) |

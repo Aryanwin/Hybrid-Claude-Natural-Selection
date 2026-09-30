@@ -156,19 +156,54 @@ CLAUDE_SYSTEM = ("You are a precise senior software engineer acting as planner, 
                  "pipeline. Follow the instructions exactly and reply in the requested format, with text only.")
 
 
-def ask_claude(prompt: str, args, name: str) -> str:
+def shared_base(ctx) -> str:
+    """Context every Claude call in a run needs. It goes in the system prompt, byte-identical across calls, so
+    after the first call it's read from Claude's prompt cache at ~10% of the input price."""
+    return f"""# Shared context for this run
+
+TASK:
+{ctx.task}
+
+EDITABLE FILES (only these may change; empty = new file):
+{fmt_files(ctx.original)}
+
+READ-ONLY CONTEXT FILES:
+{fmt_files(ctx.context_files) if ctx.context_files else "(none)"}
+
+Tests run with `python -m pytest` from the repository root, with the repo root{" and src/" if ctx.src_layout else ""}
+on sys.path. Visible tests live in {ctx.visible_path}, hidden tests in {ctx.hidden_path}.
+Use only the standard library and packages the project already uses."""
+
+
+def shared_full(ctx) -> str:
+    """shared_base + the spec and visible tests: the prefix for reviews, disputes and the judge."""
+    return f"""{shared_base(ctx)}
+
+SPEC:
+{ctx.spec}
+
+VISIBLE TESTS ({ctx.visible_path}):
+```python
+{ctx.visible_tests}```"""
+
+
+def ask_claude(prompt: str, args, name: str, shared: str = "") -> str:
     if args.no_claude:
         die("this step needs Claude but --no-claude is set")
     if not shutil.which("claude"):
         die("`claude` (Claude Code) not found on PATH. Install it or use --tests + --no-claude.")
-    cmd = ["claude", "-p", "--output-format", "json", "--tools", "", "--system-prompt", CLAUDE_SYSTEM,
+    system = CLAUDE_SYSTEM + (f"\n\n{shared}" if shared else "")
+    cmd = ["claude", "-p", "--output-format", "json", "--tools", "", "--system-prompt", system,
            "--no-session-persistence", "--strict-mcp-config", "Follow the instructions given on stdin."]
     if args.claude_model:
         cmd += ["--model", args.claude_model]
     log(f"Claude: {name} ...")
-    (args.run_dir / f"claude_{name}_prompt.txt").write_text(prompt)
+    (args.run_dir / f"claude_{name}_prompt.txt").write_text(f"=== SYSTEM ===\n{system}\n\n=== PROMPT ===\n{prompt}")
+    # A 5-minute cache is written at 1.25x the input price instead of 2x for the 1-hour default, and the calls
+    # of a run are minutes apart. (Measured: identical calls cost 37% less to write, 73% less on a cache hit.)
+    env = {**os.environ, "CLAUDE_CODE_PROMPT_CACHE_TTL": os.environ.get("CLAUDE_CODE_PROMPT_CACHE_TTL", "5m")}
     try:
-        r = run(cmd, input=prompt, timeout=900)
+        r = run(cmd, input=prompt, timeout=900, env=env)
     except subprocess.TimeoutExpired:
         die(f"Claude timed out during {name}")
     (args.run_dir / f"claude_{name}_response.txt").write_text(r.stdout + "\n--- stderr ---\n" + r.stderr)
@@ -482,47 +517,67 @@ def final_check(c: Candidate, slot: Path, ctx, args) -> tuple[bool, str]:
 
 # ----------------------------------------------------------------------------- Claude steps
 
-def claude_plan(ctx, args, repo_listing: str) -> None:
+def claude_plan(ctx, args, repo_listing: str, first_try: str = "") -> None:
+    prior = f"""
+A QUICK FIRST ATTEMPT at this task already failed; use it to see where the difficulty is (don't copy its bugs):
+{first_try}
+""" if first_try else ""
     prompt = f"""You are the PLANNER in a coding pipeline. Several small local models (~7-30B parameters)
 will write the code in competing threads; you write the spec and the tests. Your tests are the ONLY signal
-used to choose between their attempts, so make them precise, deterministic and thorough. Give tests
-descriptive names: they are used to tell which attempts solve which parts of the problem.
-Do not use any tools.
-
-TASK:
-{args.task}
-
-EDITABLE FILES (the local models may change only these; empty = new file):
-{fmt_files(ctx.original)}
-
-READ-ONLY CONTEXT FILES:
-{fmt_files(ctx.context_files) if ctx.context_files else "(none)"}
+used to choose between their attempts, so make them precise and deterministic, and give them descriptive
+names: they are used to tell which attempts solve which parts of the problem. Do not use any tools.
+Keep everything compact: your output is the most expensive part of the whole run.
 
 REPOSITORY FILES:
 {repo_listing}
-
-Tests run with `python -m pytest` from the repository root, with the repo root{" and src/" if ctx.src_layout else ""}
-on sys.path. The visible tests will be saved as {ctx.visible_path}, the hidden tests as {ctx.hidden_path}.
-Use only the standard library and packages the project already uses.
-
+{prior}
 Reply with exactly these three sections and nothing else:
 <spec>
 Numbered, concrete instructions for the local models: exact function/class signatures, behaviour,
-edge cases, error handling, constraints. Under 300 words.
+edge cases, error handling, constraints. Under 200 words.
 </spec>
 <tests>
-A complete pytest file for the main behaviour and edge cases. The local models see this file.
+A complete pytest file the local models see. At most 10 test functions; cover many cases with
+@pytest.mark.parametrize tables rather than one function per case. Under ~80 lines.
 </tests>
 <hidden_tests>
-A complete pytest file that checks the same behaviour with DIFFERENT inputs, to catch implementations
-that special-case the visible tests. The local models never see this file.
+A complete pytest file that checks the same behaviour with DIFFERENT inputs, to catch implementations that
+special-case the visible tests. At most 6 test functions, parametrized, under ~50 lines. Work out every
+expected value step by step; leave out any case you are not certain of. The local models never see this file.
 </hidden_tests>"""
-    out = ask_claude(prompt, args, "plan")
+    out = ask_claude(prompt, args, "plan", shared=shared_base(ctx))
     spec, tests, hidden = tag(out, "spec"), tag(out, "tests"), tag(out, "hidden_tests")
     if not spec or not tests:
         die(f"couldn't parse Claude's plan; see {args.run_dir}/claude_plan_response.txt")
     ctx.spec, ctx.visible_tests = spec, strip_fences(tests)
     ctx.hidden_tests = strip_fences(hidden) if hidden else ""
+
+
+def claude_oneshot(ctx, args) -> tuple[dict | None, str]:
+    """Auto mode's first try: Claude writes the change (and, without --tests, a few tests) in one lean call.
+    For small, well-specified changes this is the cheapest correct path; if it doesn't pass, the hybrid takes
+    over and starts from this attempt."""
+    want_tests = not args.tests
+    prompt = f"""Implement the TASK in the editable files. Do not use any tools.
+Reply with the complete final content of every file you change, each in exactly this format:
+
+### FILE: path/to/file.py
+```python
+<entire file content>
+```
+""" + ("""
+Then a compact pytest file that checks the behaviour, including edge cases and errors (at most 8 test
+functions, parametrized; only expected values you are certain of), in exactly this format:
+
+<tests>
+```python
+<test file>
+```
+</tests>""" if want_tests else "\nYour change must pass the project's tests.") + "\nNo explanations."
+    out = ask_claude(prompt, args, "oneshot", shared=shared_base(ctx))
+    files = parse_files(out, set(ctx.original), ctx.original)
+    tests = tag(out, "tests")
+    return files, (strip_fences(tests) if tests and "def test" in tests else "")
 
 
 def thread_digest(t: Thread, args) -> str:
@@ -550,17 +605,7 @@ def claude_review(ctx, threads: list[Thread], args, rnd: int) -> bool:
     prompt = f"""You supervise an evolutionary coding run. Several small local models each evolve their own
 thread (lineage) of attempts; each round a thread mutates its best attempt using the test failures.
 Local compute is free, your tokens are not: your job is to spend the local compute wisely.
-Do not use any tools.
-
-TASK:
-{ctx.task}
-
-SPEC:
-{ctx.spec}
-
-VISIBLE TESTS ({ctx.visible_path}):
-```python
-{clip(ctx.visible_tests, 5000)}```
+The task, spec and visible tests are in the shared context above. Do not use any tools.
 
 AVAILABLE LOCAL MODELS: {", ".join(args.models)}
 ROUND {rnd} of {args.rounds}. Live threads: {len(alive)}. Forks allowed this review: {max(0, room)}.
@@ -586,7 +631,7 @@ Reply exactly as:
  "global_hint": "optional, short, sent to every thread; empty if not needed"}}
 </decisions>
 <fixed_tests>complete corrected visible test file, ONLY if the tests themselves are wrong</fixed_tests>"""
-    out = ask_claude(prompt, args, f"review_r{rnd}")
+    out = ask_claude(prompt, args, f"review_r{rnd}", shared=shared_full(ctx))
     raw = tag(out, "decisions") or out
     m = re.search(r"\{.*\}", raw, re.S)
     try:
@@ -643,10 +688,8 @@ def claude_dispute(ctx, c: Candidate, out: str, args, rnd: int) -> str:
     Returns "tests" (hidden tests were wrong and have been replaced) or "code" (c.feedback now holds a hint)."""
     prompt = f"""A candidate passes ALL visible tests but fails some of the HIDDEN tests you wrote for this spec.
 Hidden tests are written without running them, so they are sometimes wrong. Decide who is wrong. For every failing
-assertion, work out the correct expected value from the SPEC step by step before deciding. Do not use any tools.
-
-SPEC:
-{ctx.spec}
+assertion, work out the correct expected value from the SPEC (shared context above) step by step before
+deciding. Do not use any tools.
 
 CANDIDATE CODE:
 {fmt_files({p: v for p, v in c.files.items()})}
@@ -669,7 +712,7 @@ If the hidden tests are right and the code is wrong, reply:
 <verdict>code</verdict>
 <why>one or two sentences</why>
 <hint>under 80 words for the developer: the bug and the input class it fails on, without quoting the hidden tests</hint>"""
-    reply = ask_claude(prompt, args, f"dispute_r{rnd}_{c.id}")
+    reply = ask_claude(prompt, args, f"dispute_r{rnd}_{c.id}", shared=shared_full(ctx))
     verdict = (tag(reply, "verdict") or "").strip().lower()
     why = tag(reply, "why") or ""
     fixed = tag(reply, "fixed_hidden_tests") or ""
@@ -688,14 +731,9 @@ If the hidden tests are right and the code is wrong, reply:
 def claude_judge(ctx, finalists: list[Candidate], args) -> tuple[Candidate | None, str]:
     blocks = "\n\n".join(f"CANDIDATE {i + 1}:\n```diff\n{c.diff}```" for i, c in enumerate(finalists))
     prompt = f"""You are reviewing code written by small local models. Do not use any tools.
-Every candidate below passes the visible and hidden tests. Pick the one you would merge, judging:
+Every candidate below passes the tests. Pick the one you would merge, judging:
 correctness beyond the tests, edge cases, no special-casing of tests, readability, no needless changes.
-
-TASK:
-{ctx.task}
-
-SPEC:
-{ctx.spec}
+The task and spec are in the shared context above.
 
 {blocks}
 
@@ -703,7 +741,7 @@ Reply exactly as:
 <winner>candidate number, or none if none is acceptable</winner>
 <reason>two or three sentences</reason>
 <fixes>optional: specific problems the winner still has (or, if none is acceptable, what must change)</fixes>"""
-    out = ask_claude(prompt, args, f"judge_{Usage.claude_calls}")
+    out = ask_claude(prompt, args, f"judge_{Usage.claude_calls}", shared=shared_full(ctx))
     w, reason, fixes = tag(out, "winner") or "", tag(out, "reason") or "", tag(out, "fixes") or ""
     log(f"Claude's verdict: {w} - {reason}")
     if fixes and fixes.lower() not in ("none", "n/a", ""):
@@ -828,13 +866,22 @@ def main() -> None:
     ap.add_argument("--no-crossover", action="store_true", help="don't merge threads that pass complementary tests")
     ap.add_argument("--rounds", type=int, default=8, help="maximum rounds")
     ap.add_argument("--patience", type=int, default=2, help="rounds without progress before a thread is pruned")
-    ap.add_argument("--review-every", type=int, default=2, help="Claude reviews the threads every N rounds (0 = never)")
+    ap.add_argument("--mode", choices=("auto", "hybrid", "oneshot"), default="auto",
+                    help="auto: for small changes, one lean Claude call first; the hybrid only if that fails its "
+                         "tests. hybrid: always evolve. oneshot: only the single call")
+    ap.add_argument("--oneshot-max-lines", type=int, default=400,
+                    help="auto mode tries one-shot only when the editable files total at most this many lines "
+                         "(Claude would have to rewrite them in full)")
+    ap.add_argument("--review-every", type=int, default=0,
+                    help="also review on a fixed schedule every N rounds (default 0: review only when the run "
+                         "stalls or a thread is a near miss)")
     ap.add_argument("--disputes", type=int, default=2,
                     help="times per run Claude may referee code that passes visible but fails hidden tests (0 = off)")
     ap.add_argument("--near-miss", type=int, default=2,
                     help="a thread this many failing tests from passing, stuck 2+ rounds, gets an early review and "
                          "may receive a code snippet from Claude (0 = off)")
-    ap.add_argument("--claude-budget", type=int, default=6, help="max Claude calls per run (plan + reviews + judge)")
+    ap.add_argument("--claude-budget", type=int, default=7,
+                    help="max Claude calls per run (one-shot + plan + reviews + disputes + judge)")
     ap.add_argument("--review-diff-chars", type=int, default=2500, help="diff shown to Claude per thread")
     ap.add_argument("--review-fail-chars", type=int, default=600, help="failure output shown to Claude per thread")
     ap.add_argument("--parallel", type=int, default=CFG["parallel"], help="concurrent generations per model")
@@ -843,7 +890,8 @@ def main() -> None:
     ap.add_argument("--local-timeout", type=int, default=900, help="seconds per local generation")
     ap.add_argument("--test-timeout", type=int, default=120, help="seconds per test run")
     ap.add_argument("--full-suite", action="store_true", help="finalists must also pass your whole test suite")
-    ap.add_argument("--always-judge", action="store_true", help="have Claude review even a single finalist")
+    ap.add_argument("--always-judge", action="store_true",
+                    help="always have Claude pick the winner (default: only when no hidden tests verified the finalists)")
     ap.add_argument("--no-claude", action="store_true", help="never call Claude (requires --tests)")
     ap.add_argument("--claude-model", help="e.g. sonnet or opus (default: your Claude Code default)")
     ap.add_argument("--allow-dirty", action="store_true", help="run even with uncommitted changes")
@@ -855,6 +903,8 @@ def main() -> None:
         die("--models is empty")
     if args.no_claude and not args.tests:
         die("--no-claude needs --tests (someone has to write the tests)")
+    if args.no_claude and args.mode == "oneshot":
+        die("--mode oneshot needs Claude")
     args.max_threads = max(args.max_threads, args.threads)
 
     top = run(["git", "rev-parse", "--show-toplevel"])
@@ -898,21 +948,62 @@ def main() -> None:
     log(f"Run folder (logs, prompts, patches): {args.run_dir}")
     log(f"Models: {', '.join(args.models)}")
 
-    # 1. Plan
+    # 1. Tests you supplied
     if args.tests:
         ctx.visible_path = rel(args.tests)
         ctx.visible_tests = (repo / ctx.visible_path).read_text()
         log(f"Using your tests: {ctx.visible_path}")
-    else:
+
+    # 2. Worktrees, a pool of test slots
+    n_slots = max(1, min(6, args.max_threads * args.children + 1))
+    slots = [args.run_dir / "slots" / f"slot{i}" for i in range(n_slots)]
+    for s in slots:
+        r = run(["git", "worktree", "add", "--detach", "-f", str(s), "HEAD"])
+        if r.returncode != 0:
+            die(f"git worktree add failed: {r.stderr}")
+
+    # 3. Auto mode: one lean Claude call first, when the change is small enough for that to be the cheap path
+    winner, path, seed, first_try = None, "hybrid", None, ""
+    editable_lines = sum(v.count("\n") for v in ctx.original.values())
+    if args.mode == "oneshot" or (args.mode == "auto" and not args.no_claude
+                                  and editable_lines <= args.oneshot_max_lines):
+        path = "oneshot"
+        files, oneshot_tests = claude_oneshot(ctx, args)
+        if files and not args.tests:
+            ctx.visible_tests = oneshot_tests
+        if files and ctx.visible_tests:
+            c = evaluate(Candidate("c0", files, thread="-", model="claude", kind="oneshot"), slots[0], ctx, args)
+            log(f"One-shot: {c.passed}/{c.total} tests" + (f" [{c.note}]" if c.note else ""))
+            if c.ok:
+                winner = c
+            else:
+                seed = files
+                first_try = (f"```diff\n{clip(c.diff, 3000)}```\nfailing tests: {', '.join(c.failed_tests[:10]) or '-'}\n"
+                             f"```\n{clip(c.feedback, 1200, tail=True)}\n```")
+        else:
+            log("One-shot: no usable code or tests in the reply.")
+            seed = files
+        if winner is None:
+            if args.mode == "oneshot":
+                log("One-shot attempt failed its tests; stopping (--mode oneshot).")
+            else:
+                path = "oneshot+hybrid"
+                if not args.tests:
+                    ctx.visible_tests = ""  # the planner writes fresh visible + hidden tests
+                log("One-shot didn't pass: handing over to the hybrid, starting from that attempt.")
+    hybrid = winner is None and args.mode != "oneshot"
+
+    # 4. Plan (the hybrid's spec and tests)
+    if hybrid and not args.tests:
         listing = "\n".join(run(["git", "ls-files"]).stdout.splitlines()[:300])
-        claude_plan(ctx, args, listing)
+        claude_plan(ctx, args, listing, first_try)
         log(f"Spec and tests ready ({ctx.visible_tests.count('def test')} visible, "
             f"{ctx.hidden_tests.count('def test')} hidden tests).")
     (args.run_dir / "spec.md").write_text(ctx.spec)
     (args.run_dir / "visible_tests.py.txt").write_text(ctx.visible_tests)
     (args.run_dir / "hidden_tests.py.txt").write_text(ctx.hidden_tests)
 
-    # 2. Threads
+    # 5. Threads
     threads: list[Thread] = []
     rr = [0]
 
@@ -925,21 +1016,21 @@ def main() -> None:
         return t
 
     ctx.spawn = spawn
-    for _ in range(args.threads):
-        spawn(None, "seed", 1)
+    if hybrid:
+        for _ in range(args.threads):
+            spawn(None, "seed", 1)
+        if seed:
+            # The first thread starts from Claude's one-shot attempt instead of from scratch.
+            t = threads[0]
+            c = evaluate(Candidate("c0", seed, thread=t.id, model=t.model, kind="oneshot"), slots[0], ctx, args)
+            t.best, t.origin, t.history = c, "one-shot", [f"{c.passed}/{c.total}"]
+            log(f"  {t.id} starts from the one-shot attempt ({c.passed}/{c.total} of the new tests)")
 
-    # 3. Worktrees, a pool of test slots
-    n_slots = max(1, min(6, args.max_threads * args.children + 1))
-    slots = [args.run_dir / "slots" / f"slot{i}" for i in range(n_slots)]
-    for s in slots:
-        r = run(["git", "worktree", "add", "--detach", "-f", str(s), "HEAD"])
-        if r.returncode != 0:
-            die(f"git worktree add failed: {r.stderr}")
-
-    winner, everyone, last_model, counter, rounds_run = None, [], None, 0, 0
+    everyone, last_model, counter, rounds_run = [], None, 0, 0
     disputes_left = args.disputes
+    stagnant, last_review, best_so_far = 0, 0, (-1.0, 0)
     try:
-        for rnd in range(1, args.rounds + 1):
+        for rnd in range(1, (args.rounds if hybrid else 0) + 1):
             rounds_run = rnd
             alive = [t for t in threads if t.alive]
 
@@ -1000,9 +1091,10 @@ def main() -> None:
             print_round(rnd, threads, pop)
 
             if finalists:
-                if len(finalists) == 1 and not args.always_judge:
-                    winner = finalists[0]
-                elif claude_left(args) <= 0:
+                # Hidden tests (after any dispute) already verified every finalist, so take the smallest change;
+                # Claude judges only when there were no hidden tests to rule out test-gaming, or when asked.
+                need_judge = args.always_judge or (len(finalists) > 1 and not ctx.hidden_tests)
+                if not need_judge or claude_left(args) <= 0:
                     winner = finalists[0]
                 else:
                     winner, why = claude_judge(ctx, finalists, args)
@@ -1021,12 +1113,18 @@ def main() -> None:
             alive = [t for t in threads if t.alive]
             prune_duplicates(alive, rnd)
             alive = [t for t in threads if t.alive]
-            scheduled = args.review_every and rnd % args.review_every == 0
-            stuck_close = args.near_miss and any(near_miss(t, args) for t in alive)
-            review_due = (scheduled or stuck_close) and claude_left(args) > 1  # always keep one call for the judge
-            if stuck_close and not scheduled and review_due:
-                log("  near miss: a thread is 1-2 tests from passing and stuck, asking Claude early")
+            best_now = max((t.best.progress() for t in threads if t.best), default=(-1.0, 0))
+            stagnant = 0 if best_now > best_so_far else stagnant + 1
+            best_so_far = max(best_so_far, best_now)
+            scheduled = bool(args.review_every) and rnd % args.review_every == 0
+            stuck_close = bool(args.near_miss) and any(near_miss(t, args) for t in alive)
+            stalled = stagnant >= args.patience and rnd - last_review >= 2
+            review_due = (scheduled or stuck_close or stalled) and claude_left(args) > 1  # keep one call for the judge
             if review_due:
+                why = "a thread is 1-2 tests from passing and stuck" if stuck_close else \
+                      f"no progress for {stagnant} rounds" if stalled else "scheduled"
+                log(f"  review: {why}")
+                last_review = rnd
                 if claude_review(ctx, threads, args, rnd):
                     live = [t.best for t in threads if t.alive and t.best]
                     evaluate_all(live, slots, ctx, args)  # rescore against the corrected tests
@@ -1054,8 +1152,10 @@ def main() -> None:
             tests[ctx.hidden_path] = ctx.hidden_tests
         if not args.tests:
             write_files(repo, tests)
-        log(f"Applied {winner.id} from thread {winner.thread} ({winner.model}, {changed_lines(winner.diff)} "
-            f"changed lines) to your working tree" + ("" if args.tests else f", plus tests in {test_dir}/") + ".")
+        who = "Claude's one-shot attempt" if winner.thread == "-" else \
+              f"{winner.id} from thread {winner.thread} ({winner.model})"
+        log(f"Applied {who}, {changed_lines(winner.diff)} "
+            f"changed lines, to your working tree" + ("" if args.tests else f", plus tests in {test_dir}/") + ".")
         new_files = [p for p in {**winner.files, **({} if args.tests else tests)} if not ctx.original.get(p)]
         undo = "git checkout -- " + " ".join(p for p in winner.files if ctx.original.get(p))
         if new_files:
@@ -1077,7 +1177,7 @@ def main() -> None:
     log(f"🟢 Local models: {Usage.local_tokens:,} tokens ({Usage.local_output:,} written), not billed to Claude")
     if args.summary_json:
         Path(args.summary_json).write_text(json.dumps({
-            "solved": bool(winner), "winner_model": winner.model if winner else None,
+            "solved": bool(winner), "path": path, "winner_model": winner.model if winner else None,
             "winner_lines": changed_lines(winner.diff) if winner else 0, "rounds": rounds_run,
             "seconds": round(time.time() - T0, 1), "claude_calls": Usage.claude_calls, "disputes_used": args.disputes - disputes_left,
             "claude_new": Usage.claude_new, "claude_cached": Usage.claude_cached,

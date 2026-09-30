@@ -6,7 +6,8 @@ Every task in tasks.py is solved three ways, then scored by hidden grader tests 
 
   agentic   Claude Code working normally: tools on, writes and runs its own tests until they pass
   oneshot   one minimal Claude call (no tools, short system prompt) that just writes the module
-  hybrid    evolve.py: Claude plans / reviews / judges, local models write the code
+  hybrid    evolve.py --mode hybrid: Claude plans / reviews / judges, local models write the code
+  auto      evolve.py --mode auto: one lean Claude call first, the hybrid only if that fails its tests
 
 Claude usage is exact (`claude -p --output-format json`); local usage is Ollama's own token counts.
 
@@ -36,9 +37,13 @@ sys.path.insert(0, str(BENCH))
 from tasks import TASKS  # noqa: E402
 
 ONESHOT_SYSTEM = "You are a precise senior Python engineer. Follow the instructions exactly."
-MODES = ("agentic", "oneshot", "hybrid")
-# "hybrid2" = a later hybrid rerun (near-miss snippets + hidden-test disputes), merged in with --merge-v2
-REPORT_MODES = MODES + ("hybrid2",)
+MODES = ("agentic", "oneshot", "hybrid", "auto")
+DEFAULT_MODES = ("agentic", "oneshot", "hybrid")
+# Later reruns merged into one report with FILE+V2FILE+V3FILE: their "hybrid" rows become hybrid2, hybrid3, ...
+REPORT_MODES = ("agentic", "oneshot", "hybrid", "hybrid2", "hybrid3", "auto")
+NAMES = {"agentic": "Claude Code (agentic)", "oneshot": "Claude one-shot", "hybrid": "Hybrid v1",
+         "hybrid2": "Hybrid v2 (+ near-miss, disputes)", "hybrid3": "Hybrid v3 (+ cost cuts)",
+         "auto": "Auto (one-shot first, then hybrid v3)"}
 LOCK = threading.Lock()
 
 
@@ -46,8 +51,12 @@ def load_rows(spec: str) -> list[dict]:
     """FILE or FILE+V2FILE: rows of FILE, plus the hybrid rows of V2FILE relabelled as mode "hybrid2"."""
     first, *rest = spec.split("+")
     rows = json.loads(Path(first).read_text())
-    for extra in rest:
-        rows += [{**r, "mode": "hybrid2"} for r in json.loads(Path(extra).read_text()) if r["mode"] == "hybrid"]
+    for i, extra in enumerate(rest, 2):
+        for r in json.loads(Path(extra).read_text()):
+            if r["mode"] == "hybrid":
+                rows.append({**r, "mode": f"hybrid{i}"})
+            elif r["mode"] == "auto":
+                rows.append(r)
     return rows
 
 
@@ -99,7 +108,7 @@ def run_oneshot(d: Path, module: str, spec: str, model: str | None) -> dict:
     return usage_row(data)
 
 
-def run_hybrid(d: Path, module: str, spec: str, model: str | None) -> dict:
+def run_hybrid(d: Path, module: str, spec: str, model: str | None, mode: str = "hybrid") -> dict:
     stub(d, module)
     (d / "tests").mkdir(exist_ok=True)
     (d / "tests" / ".gitkeep").touch()
@@ -107,7 +116,8 @@ def run_hybrid(d: Path, module: str, spec: str, model: str | None) -> dict:
     git = ["git", "-c", "user.name=bench", "-c", "user.email=bench@localhost"]
     for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "stub"]):
         subprocess.run(git + cmd, cwd=d, check=True, capture_output=True)
-    cmd = [sys.executable, str(REPO / "evolve.py"), spec, "--files", f"{module}.py", "--summary-json", str(d / "summary.json")]
+    cmd = [sys.executable, str(REPO / "evolve.py"), spec, "--files", f"{module}.py", "--mode", mode,
+           "--summary-json", str(d / "summary.json")]
     if model:
         cmd += ["--claude-model", model]
     with open(d / "evolve.log", "w") as log:
@@ -115,7 +125,7 @@ def run_hybrid(d: Path, module: str, spec: str, model: str | None) -> dict:
     s = json.loads((d / "summary.json").read_text())
     return {"claude_new": s["claude_new"], "claude_cached": s["claude_cached"], "claude_output": s["claude_output"],
             "cost_usd": s["claude_cost_usd"], "claude_calls": s["claude_calls"], "local_tokens": s["local_tokens"],
-            "solved_own_tests": s["solved"], "rounds": s["rounds"]}
+            "solved_own_tests": s["solved"], "rounds": s["rounds"], "path": s.get("path", mode)}
 
 
 def grade(d: Path, module: str) -> tuple[int, int]:
@@ -132,7 +142,8 @@ def grade(d: Path, module: str) -> tuple[int, int]:
     return len(cases) - failed, max(len(cases), expected)  # a module that won't import counts as all failed
 
 
-RUNNERS = {"agentic": run_agentic, "oneshot": run_oneshot, "hybrid": run_hybrid}
+RUNNERS = {"agentic": run_agentic, "oneshot": run_oneshot, "hybrid": run_hybrid,
+           "auto": lambda d, module, spec, model: run_hybrid(d, module, spec, model, mode="auto")}
 
 
 def run_one(mode, module, kind, spec, root, model, results, out):
@@ -177,8 +188,7 @@ def report(path: Path) -> str:
     by = {(r["task"], r["mode"]): r for r in rows}
     modes = [m for m in REPORT_MODES if any(r["mode"] == m for r in rows)]
     tasks = [t for t, _, _ in TASKS if any(r["task"] == t for r in rows)]
-    names = {"agentic": "Claude Code (agentic)", "oneshot": "Claude one-shot", "hybrid": "Hybrid (this repo)",
-             "hybrid2": "Hybrid v2 (+ near-miss, disputes)"}
+    names = NAMES
 
     out = ["# Benchmark results", "",
            f"{len(tasks)} tasks, each solved three ways and scored by hidden grader tests "
@@ -209,7 +219,7 @@ def report(path: Path) -> str:
     if "hybrid" in modes:
         out += ["", "**Hybrid vs. the others** (Claude cost at API prices, which weights output and cache reads correctly):", ""]
         h = total("hybrid", "cost_usd")
-        for m in (x for x in modes if not x.startswith("hybrid")):
+        for m in (x for x in modes if not x.startswith("hybrid") and x != "auto"):
             o = total(m, "cost_usd")
             if o:
                 out.append(f"- vs {names[m]}: {'saves' if h < o else 'costs'} {abs(1 - h / o):.0%} "
@@ -228,7 +238,7 @@ def report(path: Path) -> str:
                 continue
             mark = "✅" if r["passed"] == r["total"] > 0 else "❌"
             c = f"{mark} {r['passed']}/{r['total']} · {fmt(r['claude_new'] + r['claude_cached'])} / {fmt(r['claude_new'])} · ${r['cost_usd']:.3f}"
-            if m.startswith("hybrid"):
+            if m.startswith("hybrid") or m == "auto":
                 c += f" · {fmt(r['local_tokens'])} local"
             if r["note"]:
                 c += " ⚠️"
@@ -244,8 +254,7 @@ def report(path: Path) -> str:
 def compare(named: list[tuple[str, Path]]) -> str:
     """Side-by-side summary of several result files (e.g. the same benchmark with different Claude models)."""
     runs = [(label, load_rows(str(p))) for label, p in named]
-    names = {"agentic": "Claude Code (agentic)", "oneshot": "Claude one-shot", "hybrid": "Hybrid",
-             "hybrid2": "Hybrid v2 (+ near-miss, disputes)"}
+    names = NAMES
     head = "| Approach | Metric | " + " | ".join(label for label, _ in runs) + " |"
     out = ["## By Claude model", "", head, "|---|---" + "|---" * len(runs) + "|"]
     for m in REPORT_MODES:
@@ -262,7 +271,7 @@ def compare(named: list[tuple[str, Path]]) -> str:
             "Wall time": lambda rs: f"{sum(r['seconds'] for r in rs) / 60:.0f} min",
         }
         for i, (label, f) in enumerate(metrics.items()):
-            if label == "Local tokens" and not m.startswith("hybrid"):
+            if label == "Local tokens" and not (m.startswith("hybrid") or m == "auto"):
                 continue
             out.append(f"| {names[m] if i == 0 else ''} | {label} | " + " | ".join(f(rs) for rs in sel) + " |")
     return "\n".join(out) + "\n"
@@ -271,7 +280,7 @@ def compare(named: list[tuple[str, Path]]) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tasks", default="all", help="comma list of task names (default: all)")
-    ap.add_argument("--modes", default=",".join(MODES))
+    ap.add_argument("--modes", default=",".join(DEFAULT_MODES), help=f"comma list of {', '.join(MODES)}")
     ap.add_argument("--workers", type=int, default=4, help="parallel Claude-only runs")
     ap.add_argument("--claude-model", help="same Claude model for every mode (default: your Claude Code default)")
     ap.add_argument("--out", help="results JSON (default bench/results/results-<timestamp>.json)")
@@ -303,11 +312,12 @@ def main() -> None:
     print(f"{len(tasks)} tasks x {modes} -> {out}\nwork dirs: {root}", flush=True)
 
     # Hybrid runs share the local GPU, so they go one at a time; Claude-only runs overlap with them.
-    hybrid = threading.Thread(target=lambda: [run_one("hybrid", n, k, s, root, args.claude_model, results, out)
-                                              for n, k, s in tasks] if "hybrid" in modes else None)
+    local = [m for m in modes if m in ("hybrid", "auto")]  # these share the local GPU: one run at a time
+    hybrid = threading.Thread(target=lambda: [run_one(m, n, k, s, root, args.claude_model, results, out)
+                                              for m in local for n, k, s in tasks])
     hybrid.start()
     with ThreadPoolExecutor(args.workers) as ex:
-        for m in (m for m in modes if m != "hybrid"):
+        for m in (m for m in modes if m not in ("hybrid", "auto")):
             for n, k, s in tasks:
                 ex.submit(run_one, m, n, k, s, root, args.claude_model, results, out)
     hybrid.join()

@@ -19,7 +19,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 ALL_MODES = [("agentic", "Claude Code\n(agentic)"), ("oneshot", "Claude\none-shot"), ("hybrid", "Hybrid\n(v1)"),
-             ("hybrid2", "Hybrid v2\n(+ near-miss,\ndisputes)")]
+             ("hybrid2", "Hybrid v2\n(+ near-miss,\ndisputes)"), ("hybrid3", "Hybrid v3\n(+ cost cuts)"),
+             ("auto", "Auto\n(one-shot first)")]
 MODES = ALL_MODES[:3]
 THEMES = {
     "light": {"surface": "#fcfcfb", "text": "#0b0b0b", "muted": "#52514e", "grid": "#e4e3df",
@@ -33,8 +34,12 @@ def load_rows(spec: str) -> list[dict]:
     """FILE or FILE+V2FILE: rows of FILE, plus the hybrid rows of V2FILE relabelled as mode "hybrid2"."""
     first, *rest = spec.split("+")
     rows = json.loads(Path(first).read_text())
-    for extra in rest:
-        rows += [{**r, "mode": "hybrid2"} for r in json.loads(Path(extra).read_text()) if r["mode"] == "hybrid"]
+    for i, extra in enumerate(rest, 2):
+        for r in json.loads(Path(extra).read_text()):
+            if r["mode"] == "hybrid":
+                rows.append({**r, "mode": f"hybrid{i}"})
+            elif r["mode"] == "auto":
+                rows.append(r)
     return rows
 
 
