@@ -79,7 +79,9 @@ def draw(data: dict[str, dict], theme: dict, path: Path) -> None:
             for x, v in zip(xs, vals):
                 ax.text(x, v + top * 0.015, fmt(v), ha="center", va="bottom", fontsize=7.5, color=theme["muted"])
         ax.set_ylim(0, (n_tasks + 1.5) if key == "solved" else top * 1.15)
-        names = [name.replace("\n", " ").replace("( ", "(") for _, name in MODES] if stacked else [n for _, n in MODES]
+        # One-line labels fit up to four groups; beyond that keep the two-line versions so neighbours don't collide.
+        one_line = stacked and len(MODES) <= 4
+        names = [name.replace("\n", " ").replace("( ", "(") for _, name in MODES] if one_line else [n for _, n in MODES]
         ax.set_xticks(range(len(MODES)), names, fontsize=9, color=theme["text"])
         ax.tick_params(axis="y", labelsize=8, colors=theme["muted"], length=0)
         ax.tick_params(axis="x", length=0)
