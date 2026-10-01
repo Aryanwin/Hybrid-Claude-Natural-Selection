@@ -1,6 +1,7 @@
 # Local models first
 
-Free local models (Ollama on this computer) are available through the `local-evolve` MCP tools and
+Free local models (Ollama on this computer) are available through the `local-evolve-code` MCP tools (in Claude Code
+prefer these over `local-evolve`, the desktop app's lighter Chat preset) and
 `{REPO}/evolve.py`. Use them to save Claude usage:
 
 - Before writing any NEW file over ~50 lines, draft it with `local_draft` (or `local_evolve` with a concrete

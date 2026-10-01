@@ -9,7 +9,8 @@ Tools:
     local_result   keep waiting for a job that was still running
     local_models   is Ollama up, which models will be used
 
-Registered in ~/Library/Application Support/Claude/claude_desktop_config.json by register_mcp.py.
+Registered by register_mcp.py: in the Claude desktop app (Chat, Cowork) with --preset chat, and in Claude Code
+as "local-evolve-code" with --preset code.
 Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Standard library only. Logs go to stderr.
 """
 from __future__ import annotations
@@ -25,7 +26,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import evolve_chat as ec  # noqa: E402
 
-SERVER_INFO = {"name": "local-evolve", "version": "1.0.0"}
+SERVER_INFO = {"name": "local-evolve", "version": "1.1.0"}
+
+# Presets, chosen per registration with --preset (see register_mcp.py):
+#   chat  Claude desktop app (Chat, Cowork): smaller tournaments that finish in ~1-2 tool calls (~45-60 s),
+#         because Chat tends to answer by itself instead of polling a long-running job
+#   code  Claude Code: the full tournament; Claude Code polls local_result reliably
+PRESETS = {"chat": {"candidates": 4, "rounds": 1}, "code": {"candidates": 6, "rounds": 2}}
+PRESET_NAME = sys.argv[sys.argv.index("--preset") + 1] if "--preset" in sys.argv else "chat"
+if PRESET_NAME not in PRESETS:
+    sys.exit(f"unknown --preset {PRESET_NAME!r}; use one of {', '.join(PRESETS)}")
+PRESET = PRESETS[PRESET_NAME]
 
 INSTRUCTIONS = """Free local models (Ollama on the user's computer) you can hand bulky generation to, to save Claude usage.
 Use local_evolve when the user wants something long or many options where quality can be judged against a
@@ -34,8 +45,11 @@ brainstorming many names/ideas/angles. Write a short, concrete rubric; pass sour
 You get back the top 2 answers from a local tournament: pick or merge the best, check facts (small models
 hallucinate), fix the remaining critiques, and present the result as your answer.
 Do NOT use it for quick questions, facts or current events, math you can do directly, code in a repo
-(evolve.py covers that), or anything the user wants from Claude specifically. If a job is still running,
-call local_result with its job_id. If the tools report Ollama is offline, just answer normally.
+(evolve.py covers that), or anything the user wants from Claude specifically. If the tools report Ollama is
+offline, just answer normally.
+A tournament takes about a minute, longer than one tool call can wait. When a call returns "STILL RUNNING" with a
+job_id, call local_result with that job_id, and again if it is still running, until you get "RESULT READY".
+Do not write your own answer while a job is running: the local models are already writing it.
 After a reply in which you used these tools, end it with exactly two lines:
 🔴 Claude: ≈<estimate> tokens (estimate: you cannot see your exact usage; count the tool results you read plus
 the text you wrote, ÷4 characters per token, and say "estimate")
@@ -54,8 +68,8 @@ TOOLS = [
                 "rubric": {"type": "string", "description": "What a great answer does: 3-6 concrete criteria "
                                                             "(length, tone, must-include points, what to avoid)."},
                 "context": {"type": "string", "description": "Source material the answer must be based on."},
-                "candidates": {"type": "integer", "default": 6, "minimum": 2, "maximum": 12},
-                "rounds": {"type": "integer", "default": 2, "minimum": 0, "maximum": 4},
+                "candidates": {"type": "integer", "default": PRESET["candidates"], "minimum": 2, "maximum": 12},
+                "rounds": {"type": "integer", "default": PRESET["rounds"], "minimum": 0, "maximum": 4},
                 "finalists": {"type": "integer", "default": 2, "minimum": 1, "maximum": 3},
                 "max_tokens": {"type": "integer", "default": 1500, "description": "Max length of each answer."},
                 "wait_seconds": {"type": "integer", "default": 40, "maximum": 45},
@@ -145,11 +159,11 @@ def wait(job: Job, seconds) -> tuple[str, bool]:
     job.done.wait(seconds)
     if not job.done.is_set():
         el = int(time.time() - job.started)
-        return (f"Still running after {el}s ({job.progress}). job_id={job.id}. "
-                f"Call local_result with this job_id to keep waiting."), False
+        return (f"STILL RUNNING after {el}s ({job.progress}). job_id={job.id}. "
+                f"Call local_result with job_id={job.id} now to keep waiting; don't answer the user yourself yet."), False
     if job.error:
         return job.error, True
-    return job.text, False
+    return f"RESULT READY\n\n{job.text}", False
 
 
 def call_tool(name: str, args: dict) -> tuple[str, bool]:
@@ -159,7 +173,8 @@ def call_tool(name: str, args: dict) -> tuple[str, bool]:
         except ec.OllamaDown as e:
             return f"Offline: {e}", True
         return (f"Online. Writers: {', '.join(models)}. Judge: {ec.judge_model(models)}. "
-                f"Context {ec.CTX} tokens, {ec.PARALLEL} parallel slots."), False
+                f"Context {ec.CTX} tokens, {ec.PARALLEL} parallel slots. Preset '{PRESET_NAME}': "
+                f"{PRESET['candidates']} drafts, {PRESET['rounds']} revision round(s) per tournament."), False
     if name == "local_result":
         job = JOBS.get(str(args.get("job_id", "")))
         if not job:
@@ -172,7 +187,8 @@ def call_tool(name: str, args: dict) -> tuple[str, bool]:
         def run(progress):
             return ec.format_evolve(ec.evolve(
                 args["task"], args.get("rubric", ""), args.get("context", ""),
-                int(args.get("candidates", 6)), int(args.get("rounds", 2)), int(args.get("finalists", 2)),
+                int(args.get("candidates", PRESET["candidates"])), int(args.get("rounds", PRESET["rounds"])),
+                int(args.get("finalists", 2)),
                 int(args.get("max_tokens", 1500)), progress=progress))
 
         return wait(start("evolve", lambda progress: run(progress)), args.get("wait_seconds"))

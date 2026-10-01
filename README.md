@@ -160,9 +160,14 @@ command and a per-model scoreboard. Logs and patches are kept in `~/.cache/evolv
 The MCP server lets Claude hand bulky writing to the local tournament and read back only the finalists.
 
 ```bash
-python3 register_mcp.py                                   # Claude desktop app (Chat / Cowork)
-claude mcp add local-evolve -- python3 "$PWD/mcp_server.py"   # Claude Code
+python3 register_mcp.py                 # Claude desktop app (Chat / Cowork): "local-evolve", chat preset
+python3 register_mcp.py --claude-code   # Claude Code: "local-evolve-code", code preset
 ```
+
+The **chat preset** runs smaller tournaments (4 drafts, 1 revision round; about 50 s on a 24 GB Mac), so Chat gets
+its answer within one or two tool calls; Chat tends to answer by itself rather than keep polling a long job.
+The **code preset** keeps the full tournament (6 drafts, 2 rounds) because Claude Code polls `local_result`
+reliably. Either can be overridden per call with `candidates` / `rounds`.
 
 Quit the desktop app completely before running `register_mcp.py`: a running app can rewrite its config from
 memory and drop the change. Reopen it afterwards.

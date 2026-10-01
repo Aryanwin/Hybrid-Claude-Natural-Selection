@@ -21,7 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from token_footer import is_prompt  # noqa: E402  (same "message you typed" test the footer uses)
 
 MIN_LINES = 50
-LOCAL_TOOLS = ("mcp__local-evolve__local_draft", "mcp__local-evolve__local_evolve", "mcp__local-evolve__local_result")
+# Both registrations count: "local-evolve" (desktop app, chat preset) and "local-evolve-code" (Claude Code).
+LOCAL_TOOLS = tuple(f"mcp__{server}__{tool}" for server in ("local-evolve", "local-evolve-code")
+                    for tool in ("local_draft", "local_evolve", "local_result"))
 REMINDER = ("Local models first: draft any new file over ~50 lines with local_draft/local_evolve before writing it, "
             "check local_models if unsure Ollama is up, and say which parts you did without them and why.")
 
