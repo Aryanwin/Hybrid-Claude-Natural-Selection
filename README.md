@@ -57,8 +57,8 @@ Standard library only; no `pip install` beyond `pytest`.
 ## Quick start
 
 ```bash
-git clone https://github.com/Aryanwin/claude-local-evolve.git
-cd claude-local-evolve
+git clone https://github.com/Aryanwin/Hybrid-Claude-Natural-Selection.git
+cd Hybrid-Claude-Natural-Selection
 python3 install.py
 ```
 
